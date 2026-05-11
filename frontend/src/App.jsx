@@ -1286,21 +1286,21 @@ export default function App() {
               <div className="welcome-mark">
                 <Sparkles size={30} />
               </div>
-              <h1>Mau vibe code apa hari ini?</h1>
+              <h1>Apa yang bisa dibantu?</h1>
               <p>
-                Upload dokumen, file kode, atau paste GitHub repo.
+                Tanya apa saja, upload dokumen/file kode, atau paste GitHub repo.
                 UrbanMotion AI bakal bantu baca context dan lanjut coding.
               </p>
 
               <div className="suggestions">
                 <button onClick={() => setInput("Baca repo ini, jelaskan struktur project dan saran refactor")}>
-                  Analyze repo
+                  Analisis repo
                 </button>
                 <button onClick={() => setInput("Bantu debug error dari file ini")}>
                   Debug file
                 </button>
                 <button onClick={() => setInput("Buatkan fitur auth lengkap untuk project ini")}>
-                  Build feature
+                  Buat fitur
                 </button>
               </div>
             </section>
@@ -1447,7 +1447,7 @@ export default function App() {
                   ? "Tanya sesuatu tentang dokumen/file kode ini..."
                   : repoUrl.trim()
                     ? "Tanya sesuatu tentang repo ini..."
-                    : "Message UrbanMotion AI..."
+                    : "Kirim pesan ke UrbanMotion AI"
               }
               rows={1}
             />
