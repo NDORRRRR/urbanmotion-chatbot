@@ -1,0 +1,2093 @@
+const path = require("path");
+const fs = require("fs");
+const crypto = require("crypto");
+const express = require("express");
+const cors = require("cors");
+const helmet = require("helmet");
+const dotenv = require("dotenv");
+const rateLimit = require("express-rate-limit");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const multer = require("multer");
+const nodemailer = require("nodemailer");
+const { createWorker } = require("tesseract.js");
+const mammoth = require("mammoth");
+const pdfParse = require("pdf-parse");
+const { PrismaClient } = require("@prisma/client");
+
+dotenv.config();
+
+const app = express();
+const prisma = new PrismaClient();
+
+const PORT = Number(process.env.PORT || 3001);
+const JWT_SECRET = process.env.JWT_SECRET || "dev_secret_change_me";
+const APP_URL = process.env.APP_URL || "http://localhost:5173";
+const API_URL = process.env.API_URL || `http://localhost:${PORT}`;
+const UPLOAD_DIR = path.join(__dirname, "uploads");
+const MAX_CONTEXT_CHARS = Number(process.env.MAX_CONTEXT_CHARS || 120000);
+const GITHUB_MAX_FILES = Number(process.env.GITHUB_MAX_FILES || 35);
+const GITHUB_MAX_FILE_CHARS = Number(process.env.GITHUB_MAX_FILE_CHARS || 20000);
+
+if (!fs.existsSync(UPLOAD_DIR)) {
+  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+}
+
+const allowedOrigins = (process.env.CORS_ORIGIN || "http://localhost:5173")
+  .split(",")
+  .map((item) => item.trim())
+  .filter(Boolean);
+
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+      return callback(new Error("CORS blocked"));
+    },
+    credentials: true
+  })
+);
+
+app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
+app.use(express.json({ limit: "1mb" }));
+app.use("/uploads", express.static(UPLOAD_DIR));
+
+const apiLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 200,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Terlalu banyak request. Coba lagi nanti." }
+});
+
+app.use("/api", apiLimiter);
+
+const allowedExt = new Set([
+  ".txt", ".md", ".markdown",
+  ".js", ".jsx", ".ts", ".tsx",
+  ".json", ".html", ".css", ".scss",
+  ".py", ".java", ".go", ".rs", ".php", ".rb",
+  ".vue", ".svelte", ".sql", ".prisma",
+  ".yaml", ".yml", ".xml",
+  ".pdf", ".docx"
+]);
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 6 * 1024 * 1024,
+    files: 1
+  },
+  fileFilter(req, file, cb) {
+    const ext = path.extname(file.originalname || "").toLowerCase();
+
+    if (!allowedExt.has(ext)) {
+      return cb(new Error("Format file belum didukung. Pakai gambar, PDF, DOCX, TXT/MD, atau file kode."));
+    }
+
+    cb(null, true);
+  }
+});
+
+function uploadSingle(req, res, next) {
+  upload.single("file")(req, res, (error) => {
+    if (!error) return next();
+    return res.status(400).json({
+      error: error.message || "Upload file gagal."
+    });
+  });
+}
+
+
+const avatarUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 2 * 1024 * 1024,
+    files: 1
+  },
+  fileFilter(req, file, cb) {
+    const allowed = ["image/jpeg", "image/png", "image/webp"];
+
+    if (!allowed.includes(file.mimetype)) {
+      return cb(new Error("Foto profil harus JPG, PNG, atau WEBP."));
+    }
+
+    cb(null, true);
+  }
+});
+
+function avatarUploadSingle(req, res, next) {
+  avatarUpload.single("avatar")(req, res, (error) => {
+    if (!error) return next();
+
+    return res.status(400).json({
+      error: error.message || "Upload avatar gagal."
+    });
+  });
+}
+
+
+const MODEL_CONFIG = {
+  fast: {
+    id: process.env.MODEL_FAST || "claude-haiku-4.5",
+    label: "Fast",
+    description: "Cepat & hemat token",
+    vision: false,
+    allowedForFree: true
+  },
+  balanced: {
+    id: process.env.MODEL_BALANCED || "deepseek-v3",
+    label: "Balanced",
+    description: "Default pertanyaan umum",
+    vision: false,
+    allowedForFree: true
+  },
+  smart: {
+    id: process.env.MODEL_SMART || "claude-sonnet-4.5",
+    label: "Smart",
+    description: "Analisis lebih kuat",
+    vision: false,
+    allowedForFree: false
+  },
+  coding: {
+    id: process.env.MODEL_CODING || "qwen3-coder-next",
+    label: "Coding",
+    description: "Coding & debugging",
+    vision: false,
+    allowedForFree: false
+  }
+};
+
+function publicUser(user) {
+  return {
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    emailVerifiedAt: user.emailVerifiedAt,
+    avatarUrl: user.avatarUrl,
+    role: user.role,
+    plan: user.plan,
+    createdAt: user.createdAt
+  };
+}
+
+function getAdminEmails() {
+  return (process.env.ADMIN_EMAILS || "")
+    .split(",")
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function isAdminEmail(email) {
+  return getAdminEmails().includes(String(email || "").toLowerCase());
+}
+
+function todayStart() {
+  const now = new Date();
+  now.setHours(0, 0, 0, 0);
+  return now;
+}
+
+function dailyLimitForUser(user) {
+  if (user.role === "ADMIN") return Number(process.env.ADMIN_DAILY_LIMIT || 9999);
+  return Number(process.env.FREE_DAILY_LIMIT || 20);
+}
+
+async function getUsage(userId) {
+  const date = todayStart();
+
+  return prisma.dailyUsage.upsert({
+    where: {
+      userId_date: {
+        userId,
+        date
+      }
+    },
+    update: {},
+    create: {
+      userId,
+      date,
+      messageCount: 0,
+      tokenCount: 0
+    }
+  });
+}
+
+async function usagePayload(user) {
+  const usage = await getUsage(user.id);
+  return {
+    messageCount: usage.messageCount,
+    tokenCount: usage.tokenCount,
+    limit: dailyLimitForUser(user)
+  };
+}
+
+async function auth(req, res, next) {
+  try {
+    const header = req.headers.authorization || "";
+    const token = header.startsWith("Bearer ") ? header.slice(7) : "";
+
+    if (!token) {
+      return res.status(401).json({ error: "Login dulu." });
+    }
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+
+    const user = await prisma.user.findUnique({
+      where: { id: decoded.id }
+    });
+
+    if (!user) {
+      return res.status(401).json({ error: "User tidak ditemukan." });
+    }
+
+    req.user = user;
+    next();
+  } catch {
+    return res.status(401).json({ error: "Session tidak valid. Login ulang." });
+  }
+}
+
+
+function adminOnly(req, res, next) {
+  if (req.user?.role !== "ADMIN") {
+    return res.status(403).json({ error: "Admin only." });
+  }
+
+  next();
+}
+
+
+function createToken(user) {
+  return jwt.sign(
+    {
+      id: user.id,
+      email: user.email,
+      role: user.role
+    },
+    JWT_SECRET,
+    {
+      expiresIn: "7d"
+    }
+  );
+}
+
+function tokenHash(rawToken) {
+  return crypto.createHash("sha256").update(rawToken).digest("hex");
+}
+
+async function createVerificationToken(userId, type, minutes = 60) {
+  const rawToken = crypto.randomBytes(32).toString("hex");
+  const hash = tokenHash(rawToken);
+  const expiresAt = new Date(Date.now() + minutes * 60 * 1000);
+
+  await prisma.verificationToken.create({
+    data: {
+      userId,
+      tokenHash: hash,
+      type,
+      expiresAt
+    }
+  });
+
+  return rawToken;
+}
+
+function hasSmtpConfig() {
+  return Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS);
+}
+
+async function sendMail({ to, subject, html, text }) {
+  if (!hasSmtpConfig()) {
+    console.log("\n================ EMAIL DEV MODE ================");
+    console.log("To:", to);
+    console.log("Subject:", subject);
+    console.log(text || html);
+    console.log("================================================\n");
+    return;
+  }
+
+  const transporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: Number(process.env.SMTP_PORT || 465),
+    secure: String(process.env.SMTP_SECURE || "true") === "true",
+    auth: {
+      user: process.env.SMTP_USER,
+      pass: process.env.SMTP_PASS
+    }
+  });
+
+  await transporter.sendMail({
+    from: process.env.SMTP_FROM || "UrbanMotion AI <noreply@urbanmotion.web.id>",
+    to,
+    subject,
+    text,
+    html
+  });
+}
+
+async function sendVerificationEmail(user) {
+  if (user.emailVerifiedAt) return;
+
+  const rawToken = await createVerificationToken(user.id, "EMAIL_VERIFY", 24 * 60);
+  const link = `${API_URL}/api/auth/verify-email?token=${encodeURIComponent(rawToken)}`;
+
+  await sendMail({
+    to: user.email,
+    subject: "Verify your UrbanMotion AI account",
+    text: `Klik link ini untuk verifikasi akun UrbanMotion AI kamu:\n\n${link}\n\nLink berlaku 24 jam.`,
+    html: `
+      <div style="font-family:Arial,sans-serif;line-height:1.6">
+        <h2>Verify UrbanMotion AI</h2>
+        <p>Klik tombol di bawah untuk verifikasi akun kamu.</p>
+        <p><a href="${link}" style="background:#ef4444;color:#fff;padding:12px 18px;border-radius:10px;text-decoration:none">Verify Email</a></p>
+        <p>Link berlaku 24 jam.</p>
+        <p>${link}</p>
+      </div>
+    `
+  });
+}
+
+async function sendResetPasswordEmail(user) {
+  const rawToken = await createVerificationToken(user.id, "RESET_PASSWORD", 60);
+  const link = `${APP_URL}/reset-password?token=${encodeURIComponent(rawToken)}`;
+
+  await sendMail({
+    to: user.email,
+    subject: "Reset password UrbanMotion AI",
+    text: `Klik link ini untuk reset password UrbanMotion AI kamu:\n\n${link}\n\nLink berlaku 1 jam.`,
+    html: `
+      <div style="font-family:Arial,sans-serif;line-height:1.6">
+        <h2>Reset Password UrbanMotion AI</h2>
+        <p>Klik tombol di bawah untuk reset password kamu.</p>
+        <p><a href="${link}" style="background:#ef4444;color:#fff;padding:12px 18px;border-radius:10px;text-decoration:none">Reset Password</a></p>
+        <p>Link berlaku 1 jam.</p>
+        <p>${link}</p>
+      </div>
+    `
+  });
+}
+
+function redirectAuthError(res, message) {
+  const url = new URL("/auth/callback", APP_URL);
+  url.searchParams.set("error", message || "OAuth gagal.");
+  return res.redirect(url.toString());
+}
+
+function createOAuthState(provider) {
+  return jwt.sign(
+    {
+      type: "oauth",
+      provider,
+      nonce: crypto.randomBytes(12).toString("hex")
+    },
+    JWT_SECRET,
+    {
+      expiresIn: "10m"
+    }
+  );
+}
+
+function verifyOAuthState(rawState, provider) {
+  const state = jwt.verify(rawState, JWT_SECRET);
+
+  if (state.type !== "oauth" || state.provider !== provider) {
+    throw new Error("OAuth state tidak valid.");
+  }
+
+  return state;
+}
+
+async function upsertOAuthUser({ provider, providerAccountId, email, emailVerified, name, avatarUrl, accessToken, refreshToken }) {
+  const normalizedEmail = String(email || "").trim().toLowerCase();
+
+  if (!normalizedEmail) {
+    throw new Error("Provider tidak mengirim email.");
+  }
+
+  const existingAccount = await prisma.oAuthAccount.findUnique({
+    where: {
+      provider_providerAccountId: {
+        provider,
+        providerAccountId: String(providerAccountId)
+      }
+    },
+    include: {
+      user: true
+    }
+  });
+
+  if (existingAccount) {
+    const updatedUser = await prisma.user.update({
+      where: { id: existingAccount.userId },
+      data: {
+        name: name || existingAccount.user.name,
+        avatarUrl: avatarUrl || existingAccount.user.avatarUrl,
+        emailVerifiedAt: emailVerified && !existingAccount.user.emailVerifiedAt ? new Date() : existingAccount.user.emailVerifiedAt
+      }
+    });
+
+    await prisma.oAuthAccount.update({
+      where: { id: existingAccount.id },
+      data: {
+        accessToken: accessToken || existingAccount.accessToken,
+        refreshToken: refreshToken || existingAccount.refreshToken
+      }
+    });
+
+    return updatedUser;
+  }
+
+  let user = await prisma.user.findUnique({
+    where: { email: normalizedEmail }
+  });
+
+  if (!user) {
+    const admin = isAdminEmail(normalizedEmail);
+    user = await prisma.user.create({
+      data: {
+        name: name || normalizedEmail.split("@")[0],
+        email: normalizedEmail,
+        passwordHash: null,
+        avatarUrl: avatarUrl || null,
+        emailVerifiedAt: emailVerified ? new Date() : null,
+        role: admin ? "ADMIN" : "USER",
+        plan: admin ? "ADMIN" : "FREE"
+      }
+    });
+  } else {
+    user = await prisma.user.update({
+      where: { id: user.id },
+      data: {
+        name: name || user.name,
+        avatarUrl: avatarUrl || user.avatarUrl,
+        emailVerifiedAt: emailVerified && !user.emailVerifiedAt ? new Date() : user.emailVerifiedAt
+      }
+    });
+  }
+
+  await prisma.oAuthAccount.create({
+    data: {
+      userId: user.id,
+      provider,
+      providerAccountId: String(providerAccountId),
+      accessToken: accessToken || null,
+      refreshToken: refreshToken || null
+    }
+  });
+
+  return user;
+}
+
+function makeConversationTitle(text, hasFile, repoUrl) {
+  const clean = String(text || "").trim().replace(/\s+/g, " ");
+  if (clean) return clean.slice(0, 42);
+  if (repoUrl) return "Bahas GitHub repo";
+  if (hasFile) return "Bahas dokumen";
+  return "Chat baru";
+}
+
+function saveUploadForUser(userId, file) {
+  const userDir = path.join(UPLOAD_DIR, userId);
+  if (!fs.existsSync(userDir)) {
+    fs.mkdirSync(userDir, { recursive: true });
+  }
+
+  const ext = path.extname(file.originalname || "").toLowerCase() || ".bin";
+  const safeName = `${Date.now()}-${crypto.randomUUID()}${ext}`;
+  const fullPath = path.join(userDir, safeName);
+
+  fs.writeFileSync(fullPath, file.buffer);
+
+  return {
+    url: `/uploads/${userId}/${safeName}`,
+    name: file.originalname,
+    mime: file.mimetype
+  };
+}
+
+function isImageFile(file) {
+  return Boolean(file?.mimetype?.startsWith("image/"));
+}
+
+function isLikelyTextFile(file) {
+  const ext = path.extname(file.originalname || "").toLowerCase();
+  return [
+    ".txt", ".md", ".markdown",
+    ".js", ".jsx", ".ts", ".tsx",
+    ".json", ".html", ".css", ".scss",
+    ".py", ".java", ".go", ".rs", ".php", ".rb",
+    ".vue", ".svelte", ".sql", ".prisma",
+    ".yaml", ".yml", ".xml"
+  ].includes(ext);
+}
+
+async function extractTextFromImage(file) {
+  if (!file || process.env.ENABLE_IMAGE_OCR === "false") {
+    return "";
+  }
+
+  let worker;
+
+  try {
+    worker = await createWorker("eng");
+    const result = await worker.recognize(file.buffer);
+    const text = String(result?.data?.text || "")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+
+    return text.slice(0, 6000);
+  } catch (error) {
+    console.warn("OCR failed:", error.message);
+    return "";
+  } finally {
+    if (worker) {
+      await worker.terminate();
+    }
+  }
+}
+
+async function extractTextFromFile(file) {
+  if (!file) return "";
+
+  const ext = path.extname(file.originalname || "").toLowerCase();
+
+  if (isImageFile(file)) {
+    const ocrText = await extractTextFromImage(file);
+    return ocrText
+      ? [
+          "=== OCR DARI GAMBAR ===",
+          ocrText
+        ].join("\n")
+      : "";
+  }
+
+  if (isLikelyTextFile(file)) {
+    return file.buffer.toString("utf8").slice(0, MAX_CONTEXT_CHARS);
+  }
+
+  if (ext === ".pdf") {
+    try {
+      const data = await pdfParse(file.buffer);
+      return String(data.text || "").slice(0, MAX_CONTEXT_CHARS);
+    } catch (error) {
+      console.warn("PDF parse failed:", error.message);
+      return "";
+    }
+  }
+
+  if (ext === ".docx") {
+    try {
+      const data = await mammoth.extractRawText({ buffer: file.buffer });
+      return String(data.value || "").slice(0, MAX_CONTEXT_CHARS);
+    } catch (error) {
+      console.warn("DOCX parse failed:", error.message);
+      return "";
+    }
+  }
+
+  return "";
+}
+
+function parseGitHubUrl(input) {
+  const value = String(input || "").trim();
+  if (!value) return null;
+
+  let url;
+
+  try {
+    url = new URL(value);
+  } catch {
+    return null;
+  }
+
+  if (!["github.com", "www.github.com"].includes(url.hostname)) {
+    return null;
+  }
+
+  const parts = url.pathname.split("/").filter(Boolean);
+  const owner = parts[0];
+  const repo = parts[1]?.replace(/\.git$/, "");
+
+  if (!owner || !repo) return null;
+
+  let branch = "";
+  let subPath = "";
+
+  const treeIndex = parts.indexOf("tree");
+  if (treeIndex >= 0 && parts[treeIndex + 1]) {
+    branch = parts[treeIndex + 1];
+    subPath = parts.slice(treeIndex + 2).join("/");
+  }
+
+  return {
+    owner,
+    repo,
+    branch,
+    subPath,
+    url: `https://github.com/${owner}/${repo}`
+  };
+}
+
+function shouldIncludeRepoFile(filePath) {
+  const normalized = filePath.replace(/\\/g, "/");
+  const lowered = normalized.toLowerCase();
+
+  const ignoredSegments = [
+    "node_modules/",
+    "dist/",
+    "build/",
+    ".next/",
+    ".nuxt/",
+    ".git/",
+    "coverage/",
+    "vendor/",
+    "target/",
+    "__pycache__/"
+  ];
+
+  if (ignoredSegments.some((segment) => lowered.includes(segment))) return false;
+
+  const ignoredNames = [
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "bun.lockb"
+  ];
+
+  if (ignoredNames.some((name) => lowered.endsWith(name))) return false;
+
+  const ext = path.extname(lowered);
+  const allowedRepoExt = new Set([
+    ".js", ".jsx", ".ts", ".tsx",
+    ".json", ".html", ".css", ".scss",
+    ".py", ".java", ".go", ".rs", ".php", ".rb",
+    ".vue", ".svelte", ".sql", ".prisma",
+    ".md", ".txt", ".yaml", ".yml", ".xml",
+    ".env", ".example"
+  ]);
+
+  if (allowedRepoExt.has(ext)) return true;
+
+  const base = path.basename(lowered);
+  return [
+    "package.json",
+    "vite.config.js",
+    "vite.config.ts",
+    "next.config.js",
+    "tailwind.config.js",
+    "postcss.config.js",
+    "dockerfile",
+    "docker-compose.yml",
+    ".env.example",
+    "readme.md"
+  ].includes(base);
+}
+
+async function fetchJson(url) {
+  const headers = {
+    "User-Agent": "UrbanMotion-AI"
+  };
+
+  if (process.env.GITHUB_TOKEN) {
+    headers.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+  }
+
+  const res = await fetch(url, { headers });
+
+  if (!res.ok) {
+    throw new Error(`GitHub request failed ${res.status}`);
+  }
+
+  return res.json();
+}
+
+async function fetchText(url) {
+  const headers = {
+    "User-Agent": "UrbanMotion-AI"
+  };
+
+  if (process.env.GITHUB_TOKEN) {
+    headers.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+  }
+
+  const res = await fetch(url, { headers });
+
+  if (!res.ok) {
+    throw new Error(`GitHub raw fetch failed ${res.status}`);
+  }
+
+  return res.text();
+}
+
+async function fetchGitHubRepoContext(repoUrl) {
+  const parsed = parseGitHubUrl(repoUrl);
+  if (!parsed) return "";
+
+  const repoMeta = await fetchJson(`https://api.github.com/repos/${parsed.owner}/${parsed.repo}`);
+  const branch = parsed.branch || repoMeta.default_branch || "main";
+  const tree = await fetchJson(
+    `https://api.github.com/repos/${parsed.owner}/${parsed.repo}/git/trees/${encodeURIComponent(branch)}?recursive=1`
+  );
+
+  let files = (tree.tree || [])
+    .filter((item) => item.type === "blob")
+    .filter((item) => !parsed.subPath || item.path.startsWith(`${parsed.subPath}/`) || item.path === parsed.subPath)
+    .filter((item) => shouldIncludeRepoFile(item.path))
+    .filter((item) => Number(item.size || 0) <= 250000);
+
+  const priority = (filePath) => {
+    const base = path.basename(filePath.toLowerCase());
+    if (base === "readme.md") return 0;
+    if (base === "package.json") return 1;
+    if (filePath.includes("src/")) return 2;
+    return 3;
+  };
+
+  files = files
+    .sort((a, b) => priority(a.path) - priority(b.path) || a.path.localeCompare(b.path))
+    .slice(0, GITHUB_MAX_FILES);
+
+  const chunks = [
+    `=== GITHUB REPOSITORY CONTEXT ===`,
+    `Repository: ${parsed.url}`,
+    `Branch: ${branch}`,
+    parsed.subPath ? `Subpath: ${parsed.subPath}` : "",
+    `Files included: ${files.length}`,
+    ""
+  ].filter(Boolean);
+
+  let totalChars = chunks.join("\n").length;
+
+  for (const file of files) {
+    if (totalChars >= MAX_CONTEXT_CHARS) break;
+
+    const rawUrl = `https://raw.githubusercontent.com/${parsed.owner}/${parsed.repo}/${encodeURIComponent(branch)}/${file.path
+      .split("/")
+      .map(encodeURIComponent)
+      .join("/")}`;
+
+    try {
+      const content = await fetchText(rawUrl);
+      const sliced = content.slice(0, GITHUB_MAX_FILE_CHARS);
+      const block = [
+        `--- FILE: ${file.path} ---`,
+        sliced,
+        ""
+      ].join("\n");
+
+      chunks.push(block);
+      totalChars += block.length;
+    } catch (error) {
+      chunks.push(`--- FILE: ${file.path} ---\n[Gagal fetch file: ${error.message}]\n`);
+    }
+  }
+
+  return chunks.join("\n").slice(0, MAX_CONTEXT_CHARS);
+}
+
+function buildContextText({ extractedFileText, repoContext }) {
+  const blocks = [];
+
+  if (extractedFileText) {
+    blocks.push([
+      "=== ATTACHED DOCUMENT / IMAGE TEXT ===",
+      extractedFileText
+    ].join("\n"));
+  }
+
+  if (repoContext) {
+    blocks.push(repoContext);
+  }
+
+  return blocks.join("\n\n").slice(0, MAX_CONTEXT_CHARS);
+}
+
+function mapHistoryMessage(message) {
+  let content = message.content;
+
+  if (message.contextText) {
+    content = [
+      message.content,
+      "",
+      "Konteks yang pernah dilampirkan user pada pesan ini:",
+      message.contextText
+    ].join("\n");
+  }
+
+  return {
+    role: message.role === "ASSISTANT" ? "assistant" : "user",
+    content
+  };
+}
+
+function buildImageAwareText(text, contextText) {
+  const cleanText = String(text || "").trim() || "Tolong analisis lampiran ini.";
+
+  if (!contextText) {
+    return cleanText;
+  }
+
+  return [
+    cleanText,
+    "",
+    "Gunakan konteks berikut untuk menjawab. Konteks ini berasal dari file, OCR screenshot, atau GitHub repo yang dilampirkan user.",
+    "Jika konteks tidak cukup, bilang apa yang kurang. Jangan mengarang isi file/repo.",
+    "",
+    contextText
+  ].join("\n");
+}
+
+function buildSystemPrompt() {
+  return [
+    "Kamu adalah UrbanMotion AI, chatbot publik multi-model.",
+    "Jawab dengan jelas, berguna, dan tidak bertele-tele.",
+    "Gunakan bahasa yang sama dengan user.",
+    "Jika user bertanya dalam bahasa Indonesia santai, jawab santai tapi tetap rapi.",
+    "Kamu bisa membantu vibe coding: memahami repo, debugging, membuat fitur, refactor, menjelaskan error, dan menyarankan struktur project.",
+    "Jangan mengklaim membaca file/repo jika konteks tidak tersedia.",
+    "Jangan membantu tindakan ilegal, malware, pencurian data, bypass keamanan, atau penyalahgunaan sistem.",
+    "Jika tidak yakin, jelaskan batasannya dengan jujur."
+  ].join(" ");
+}
+
+async function callX5Lab({ modelId, text, file, history, contextText, sendImageBlock }) {
+  if (!process.env.X5LAB_API_KEY) {
+    throw new Error("X5LAB_API_KEY belum diisi di .env backend.");
+  }
+
+  const imageAwareText = buildImageAwareText(text, contextText);
+
+  const userContent = sendImageBlock && file && isImageFile(file)
+    ? [
+        {
+          type: "text",
+          text: imageAwareText
+        },
+        {
+          type: "image_url",
+          image_url: {
+            url: `data:${file.mimetype};base64,${file.buffer.toString("base64")}`
+          }
+        }
+      ]
+    : imageAwareText;
+
+  const messages = [
+    {
+      role: "system",
+      content: buildSystemPrompt()
+    },
+    ...history.map(mapHistoryMessage),
+    {
+      role: "user",
+      content: userContent
+    }
+  ];
+
+  const response = await fetch("https://api.x5lab.dev/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.X5LAB_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: modelId,
+      messages,
+      temperature: 0.7,
+      max_tokens: 1600
+    })
+  });
+
+  const rawText = await response.text();
+
+  let data;
+  try {
+    data = JSON.parse(rawText);
+  } catch {
+    data = null;
+  }
+
+  if (!response.ok) {
+    const detail = data?.error?.message || data?.error || rawText || `HTTP ${response.status}`;
+    const error = new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+    error.status = response.status;
+    throw error;
+  }
+
+  const answer = data?.choices?.[0]?.message?.content || "AI tidak mengirim jawaban.";
+  const totalTokens = Number(data?.usage?.total_tokens || 0);
+
+  return {
+    answer,
+    usage: data?.usage || null,
+    totalTokens
+  };
+}
+
+app.get("/", (req, res) => {
+  res.json({
+    status: "UrbanMotion AI API running",
+    endpoints: ["/api/auth/register", "/api/auth/login", "/api/auth/google", "/api/auth/github", "/api/me", "/api/chat"]
+  });
+});
+
+app.get("/api/models", (req, res) => {
+  res.json(
+    Object.entries(MODEL_CONFIG).map(([key, value]) => ({
+      key,
+      label: value.label,
+      description: value.description,
+      vision: value.vision,
+      allowedForFree: value.allowedForFree
+    }))
+  );
+});
+
+app.post("/api/auth/register", async (req, res) => {
+  try {
+    const name = String(req.body.name || "").trim();
+    const email = String(req.body.email || "").trim().toLowerCase();
+    const password = String(req.body.password || "");
+
+    if (!name || !email || !password) {
+      return res.status(400).json({ error: "Nama, email, dan password wajib diisi." });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({ error: "Password minimal 6 karakter." });
+    }
+
+    const existing = await prisma.user.findUnique({
+      where: { email }
+    });
+
+    if (existing) {
+      return res.status(409).json({ error: "Email sudah terdaftar." });
+    }
+
+    const admin = isAdminEmail(email);
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    const user = await prisma.user.create({
+      data: {
+        name,
+        email,
+        passwordHash,
+        emailVerifiedAt: admin ? new Date() : null,
+        role: admin ? "ADMIN" : "USER",
+        plan: admin ? "ADMIN" : "FREE"
+      }
+    });
+
+    if (!admin) {
+      await sendVerificationEmail(user);
+    }
+
+    const token = createToken(user);
+
+    res.status(201).json({
+      token,
+      user: publicUser(user),
+      usage: await usagePayload(user),
+      message: admin
+        ? "Akun admin berhasil dibuat."
+        : "Akun berhasil dibuat. Cek email untuk verifikasi. Kalau SMTP belum diset, link muncul di terminal backend."
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: "Register gagal.",
+      detail: error.message
+    });
+  }
+});
+
+app.post("/api/auth/login", async (req, res) => {
+  try {
+    const email = String(req.body.email || "").trim().toLowerCase();
+    const password = String(req.body.password || "");
+
+    if (!email || !password) {
+      return res.status(400).json({ error: "Email dan password wajib diisi." });
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { email }
+    });
+
+    if (!user) {
+      return res.status(401).json({ error: "Email atau password salah." });
+    }
+
+    if (!user.passwordHash) {
+      return res.status(401).json({ error: "Akun ini dibuat dengan Google/GitHub. Login lewat provider tersebut." });
+    }
+
+    const match = await bcrypt.compare(password, user.passwordHash);
+
+    if (!match) {
+      return res.status(401).json({ error: "Email atau password salah." });
+    }
+
+    const token = createToken(user);
+
+    res.json({
+      token,
+      user: publicUser(user),
+      usage: await usagePayload(user)
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: "Login gagal.",
+      detail: error.message
+    });
+  }
+});
+
+app.get("/api/auth/google", (req, res) => {
+  if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CALLBACK_URL) {
+    return res.status(500).send("Google OAuth belum dikonfigurasi di .env.");
+  }
+
+  const state = createOAuthState("google");
+  const url = new URL("https://accounts.google.com/o/oauth2/v2/auth");
+
+  url.searchParams.set("client_id", process.env.GOOGLE_CLIENT_ID);
+  url.searchParams.set("redirect_uri", process.env.GOOGLE_CALLBACK_URL);
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("scope", "openid email profile");
+  url.searchParams.set("prompt", "select_account");
+  url.searchParams.set("state", state);
+
+  res.redirect(url.toString());
+});
+
+app.get("/api/auth/google/callback", async (req, res) => {
+  try {
+    const code = String(req.query.code || "");
+    const state = String(req.query.state || "");
+
+    if (!code || !state) {
+      return redirectAuthError(res, "Google callback tidak lengkap.");
+    }
+
+    verifyOAuthState(state, "google");
+
+    const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      body: new URLSearchParams({
+        code,
+        client_id: process.env.GOOGLE_CLIENT_ID,
+        client_secret: process.env.GOOGLE_CLIENT_SECRET,
+        redirect_uri: process.env.GOOGLE_CALLBACK_URL,
+        grant_type: "authorization_code"
+      })
+    });
+
+    const tokenData = await tokenRes.json();
+
+    if (!tokenRes.ok) {
+      return redirectAuthError(res, tokenData.error_description || "Gagal exchange token Google.");
+    }
+
+    const profileRes = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
+      headers: {
+        Authorization: `Bearer ${tokenData.access_token}`
+      }
+    });
+
+    const profile = await profileRes.json();
+
+    if (!profileRes.ok) {
+      return redirectAuthError(res, "Gagal mengambil profile Google.");
+    }
+
+    const user = await upsertOAuthUser({
+      provider: "google",
+      providerAccountId: profile.sub,
+      email: profile.email,
+      emailVerified: Boolean(profile.email_verified),
+      name: profile.name || profile.email,
+      avatarUrl: profile.picture || null,
+      accessToken: tokenData.access_token,
+      refreshToken: tokenData.refresh_token
+    });
+
+    const appToken = createToken(user);
+    const url = new URL("/auth/callback", APP_URL);
+    url.searchParams.set("token", appToken);
+    res.redirect(url.toString());
+  } catch (error) {
+    return redirectAuthError(res, error.message);
+  }
+});
+
+app.get("/api/auth/github", (req, res) => {
+  if (!process.env.GITHUB_CLIENT_ID || !process.env.GITHUB_CALLBACK_URL) {
+    return res.status(500).send("GitHub OAuth belum dikonfigurasi di .env.");
+  }
+
+  const state = createOAuthState("github");
+  const url = new URL("https://github.com/login/oauth/authorize");
+
+  url.searchParams.set("client_id", process.env.GITHUB_CLIENT_ID);
+  url.searchParams.set("redirect_uri", process.env.GITHUB_CALLBACK_URL);
+  url.searchParams.set("scope", "read:user user:email");
+  url.searchParams.set("state", state);
+
+  res.redirect(url.toString());
+});
+
+app.get("/api/auth/github/callback", async (req, res) => {
+  try {
+    const code = String(req.query.code || "");
+    const state = String(req.query.state || "");
+
+    if (!code || !state) {
+      return redirectAuthError(res, "GitHub callback tidak lengkap.");
+    }
+
+    verifyOAuthState(state, "github");
+
+    const tokenRes = await fetch("https://github.com/login/oauth/access_token", {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        client_id: process.env.GITHUB_CLIENT_ID,
+        client_secret: process.env.GITHUB_CLIENT_SECRET,
+        redirect_uri: process.env.GITHUB_CALLBACK_URL,
+        code
+      })
+    });
+
+    const tokenData = await tokenRes.json();
+
+    if (!tokenRes.ok || tokenData.error) {
+      return redirectAuthError(res, tokenData.error_description || "Gagal exchange token GitHub.");
+    }
+
+    const userRes = await fetch("https://api.github.com/user", {
+      headers: {
+        Authorization: `Bearer ${tokenData.access_token}`,
+        "User-Agent": "UrbanMotion-AI"
+      }
+    });
+
+    const ghUser = await userRes.json();
+
+    if (!userRes.ok) {
+      return redirectAuthError(res, "Gagal mengambil profile GitHub.");
+    }
+
+    const emailRes = await fetch("https://api.github.com/user/emails", {
+      headers: {
+        Authorization: `Bearer ${tokenData.access_token}`,
+        "User-Agent": "UrbanMotion-AI"
+      }
+    });
+
+    const emails = emailRes.ok ? await emailRes.json() : [];
+    const primary = Array.isArray(emails)
+      ? emails.find((item) => item.primary && item.verified) || emails.find((item) => item.verified) || emails[0]
+      : null;
+
+    const email = primary?.email || ghUser.email;
+
+    if (!email) {
+      return redirectAuthError(res, "GitHub tidak mengirim email. Pastikan email GitHub bisa diakses.");
+    }
+
+    const user = await upsertOAuthUser({
+      provider: "github",
+      providerAccountId: ghUser.id,
+      email,
+      emailVerified: Boolean(primary?.verified || ghUser.email),
+      name: ghUser.name || ghUser.login || email,
+      avatarUrl: ghUser.avatar_url || null,
+      accessToken: tokenData.access_token,
+      refreshToken: null
+    });
+
+    const appToken = createToken(user);
+    const url = new URL("/auth/callback", APP_URL);
+    url.searchParams.set("token", appToken);
+    res.redirect(url.toString());
+  } catch (error) {
+    return redirectAuthError(res, error.message);
+  }
+});
+
+app.post("/api/auth/verify-email/send", auth, async (req, res) => {
+  try {
+    if (req.user.emailVerifiedAt) {
+      return res.json({ message: "Email sudah terverifikasi." });
+    }
+
+    await sendVerificationEmail(req.user);
+
+    res.json({
+      message: "Link verifikasi sudah dikirim. Kalau SMTP belum diset, cek terminal backend."
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: "Gagal mengirim email verifikasi.",
+      detail: error.message
+    });
+  }
+});
+
+app.get("/api/auth/verify-email", async (req, res) => {
+  try {
+    const rawToken = String(req.query.token || "");
+
+    if (!rawToken) {
+      const url = new URL("/auth/verified", APP_URL);
+      url.searchParams.set("status", "error");
+      url.searchParams.set("message", "Token kosong.");
+      return res.redirect(url.toString());
+    }
+
+    const record = await prisma.verificationToken.findUnique({
+      where: {
+        tokenHash: tokenHash(rawToken)
+      },
+      include: {
+        user: true
+      }
+    });
+
+    if (!record || record.type !== "EMAIL_VERIFY" || record.usedAt || record.expiresAt < new Date()) {
+      const url = new URL("/auth/verified", APP_URL);
+      url.searchParams.set("status", "error");
+      url.searchParams.set("message", "Token verifikasi tidak valid atau sudah expired.");
+      return res.redirect(url.toString());
+    }
+
+    await prisma.$transaction([
+      prisma.user.update({
+        where: { id: record.userId },
+        data: { emailVerifiedAt: new Date() }
+      }),
+      prisma.verificationToken.update({
+        where: { id: record.id },
+        data: { usedAt: new Date() }
+      })
+    ]);
+
+    const url = new URL("/auth/verified", APP_URL);
+    url.searchParams.set("status", "success");
+    return res.redirect(url.toString());
+  } catch (error) {
+    const url = new URL("/auth/verified", APP_URL);
+    url.searchParams.set("status", "error");
+    url.searchParams.set("message", error.message);
+    return res.redirect(url.toString());
+  }
+});
+
+app.post("/api/auth/forgot-password", async (req, res) => {
+  try {
+    const email = String(req.body.email || "").trim().toLowerCase();
+
+    if (!email) {
+      return res.status(400).json({ error: "Email wajib diisi." });
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { email }
+    });
+
+    if (user) {
+      await sendResetPasswordEmail(user);
+    }
+
+    res.json({
+      message: "Kalau email terdaftar, link reset password akan dikirim. Kalau SMTP belum diset, cek terminal backend."
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: "Gagal memproses reset password.",
+      detail: error.message
+    });
+  }
+});
+
+app.post("/api/auth/reset-password", async (req, res) => {
+  try {
+    const rawToken = String(req.body.token || "");
+    const password = String(req.body.password || "");
+
+    if (!rawToken || !password) {
+      return res.status(400).json({ error: "Token dan password wajib diisi." });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({ error: "Password minimal 6 karakter." });
+    }
+
+    const record = await prisma.verificationToken.findUnique({
+      where: {
+        tokenHash: tokenHash(rawToken)
+      }
+    });
+
+    if (!record || record.type !== "RESET_PASSWORD" || record.usedAt || record.expiresAt < new Date()) {
+      return res.status(400).json({ error: "Token reset tidak valid atau expired." });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    await prisma.$transaction([
+      prisma.user.update({
+        where: { id: record.userId },
+        data: {
+          passwordHash,
+          emailVerifiedAt: new Date()
+        }
+      }),
+      prisma.verificationToken.update({
+        where: { id: record.id },
+        data: { usedAt: new Date() }
+      })
+    ]);
+
+    res.json({
+      message: "Password berhasil direset. Silakan login."
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: "Reset password gagal.",
+      detail: error.message
+    });
+  }
+});
+
+app.get("/api/me", auth, async (req, res) => {
+  res.json({
+    user: publicUser(req.user),
+    usage: await usagePayload(req.user)
+  });
+});
+
+
+app.get("/api/account", auth, async (req, res) => {
+  const accounts = await prisma.oAuthAccount.findMany({
+    where: {
+      userId: req.user.id
+    },
+    select: {
+      id: true,
+      provider: true,
+      providerAccountId: true,
+      createdAt: true,
+      updatedAt: true
+    },
+    orderBy: {
+      createdAt: "asc"
+    }
+  });
+
+  res.json({
+    user: publicUser(req.user),
+    usage: await usagePayload(req.user),
+    accounts
+  });
+});
+
+
+app.post("/api/account/avatar", auth, avatarUploadSingle, async (req, res) => {
+  try {
+    const file = req.file;
+
+    if (!file) {
+      return res.status(400).json({ error: "File avatar wajib diupload." });
+    }
+
+    const saved = saveUploadForUser(req.user.id, file);
+
+    const updated = await prisma.user.update({
+      where: {
+        id: req.user.id
+      },
+      data: {
+        avatarUrl: saved.url
+      }
+    });
+
+    res.json({
+      user: publicUser(updated),
+      avatarUrl: saved.url,
+      message: "Foto profil berhasil diperbarui."
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: "Gagal upload foto profil.",
+      detail: error.message
+    });
+  }
+});
+
+app.patch("/api/account/profile", auth, async (req, res) => {
+  try {
+    const name = String(req.body.name || "").trim();
+    const avatarUrl = String(req.body.avatarUrl || "").trim();
+
+    if (!name || name.length < 2) {
+      return res.status(400).json({ error: "Nama minimal 2 karakter." });
+    }
+
+    if (avatarUrl && !/^https?:\/\//i.test(avatarUrl)) {
+      return res.status(400).json({ error: "Avatar URL harus diawali http:// atau https://." });
+    }
+
+    const updated = await prisma.user.update({
+      where: {
+        id: req.user.id
+      },
+      data: {
+        name,
+        avatarUrl: avatarUrl || null
+      }
+    });
+
+    res.json({
+      user: publicUser(updated),
+      message: "Profil berhasil diperbarui."
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: "Gagal update profil.",
+      detail: error.message
+    });
+  }
+});
+
+app.post("/api/account/change-password", auth, async (req, res) => {
+  try {
+    const currentPassword = String(req.body.currentPassword || "");
+    const newPassword = String(req.body.newPassword || "");
+
+    if (!newPassword || newPassword.length < 6) {
+      return res.status(400).json({ error: "Password baru minimal 6 karakter." });
+    }
+
+    if (req.user.passwordHash) {
+      if (!currentPassword) {
+        return res.status(400).json({ error: "Password lama wajib diisi." });
+      }
+
+      const match = await bcrypt.compare(currentPassword, req.user.passwordHash);
+
+      if (!match) {
+        return res.status(401).json({ error: "Password lama salah." });
+      }
+    }
+
+    const passwordHash = await bcrypt.hash(newPassword, 10);
+
+    await prisma.user.update({
+      where: {
+        id: req.user.id
+      },
+      data: {
+        passwordHash
+      }
+    });
+
+    res.json({
+      message: req.user.passwordHash
+        ? "Password berhasil diganti."
+        : "Password berhasil dibuat untuk akun ini."
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: "Gagal ganti password.",
+      detail: error.message
+    });
+  }
+});
+
+app.delete("/api/account", auth, async (req, res) => {
+  try {
+    await prisma.user.delete({
+      where: {
+        id: req.user.id
+      }
+    });
+
+    res.json({
+      ok: true,
+      message: "Akun berhasil dihapus."
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: "Gagal hapus akun.",
+      detail: error.message
+    });
+  }
+});
+
+
+app.get("/api/conversations", auth, async (req, res) => {
+  const conversations = await prisma.conversation.findMany({
+    where: {
+      userId: req.user.id
+    },
+    orderBy: {
+      updatedAt: "desc"
+    },
+    take: 50,
+    include: {
+      messages: {
+        orderBy: { createdAt: "desc" },
+        take: 1
+      }
+    }
+  });
+
+  res.json({
+    conversations: conversations.map((item) => ({
+      id: item.id,
+      title: item.title,
+      model: item.model,
+      updatedAt: item.updatedAt,
+      lastMessage: item.messages[0]?.content || ""
+    }))
+  });
+});
+
+
+app.patch("/api/conversations/:id", auth, async (req, res) => {
+  try {
+    const title = String(req.body.title || "").trim();
+
+    if (!title || title.length > 80) {
+      return res.status(400).json({ error: "Judul wajib diisi dan maksimal 80 karakter." });
+    }
+
+    const conversation = await prisma.conversation.findFirst({
+      where: {
+        id: req.params.id,
+        userId: req.user.id
+      }
+    });
+
+    if (!conversation) {
+      return res.status(404).json({ error: "Conversation tidak ditemukan." });
+    }
+
+    const updated = await prisma.conversation.update({
+      where: { id: conversation.id },
+      data: { title }
+    });
+
+    res.json({ conversation: updated });
+  } catch (error) {
+    res.status(500).json({ error: "Gagal rename chat.", detail: error.message });
+  }
+});
+
+app.delete("/api/conversations", auth, async (req, res) => {
+  try {
+    const result = await prisma.conversation.deleteMany({
+      where: {
+        userId: req.user.id
+      }
+    });
+
+    res.json({
+      ok: true,
+      deleted: result.count
+    });
+  } catch (error) {
+    res.status(500).json({ error: "Gagal hapus semua chat.", detail: error.message });
+  }
+});
+
+app.post("/api/conversations/:id/regenerate", auth, async (req, res) => {
+  try {
+    const selectedKey = String(req.body.model || "balanced").trim();
+    const model = MODEL_CONFIG[selectedKey];
+
+    if (!model) {
+      return res.status(400).json({ error: "Model tidak valid." });
+    }
+
+    if (req.user.role !== "ADMIN" && !model.allowedForFree) {
+      return res.status(403).json({ error: "Model ini khusus admin dulu." });
+    }
+
+    const conversation = await prisma.conversation.findFirst({
+      where: {
+        id: req.params.id,
+        userId: req.user.id
+      }
+    });
+
+    if (!conversation) {
+      return res.status(404).json({ error: "Conversation tidak ditemukan." });
+    }
+
+    const allMessages = await prisma.message.findMany({
+      where: { conversationId: conversation.id },
+      orderBy: { createdAt: "asc" }
+    });
+
+    const lastUserMessage = [...allMessages].reverse().find((item) => item.role === "USER");
+
+    if (!lastUserMessage) {
+      return res.status(400).json({ error: "Tidak ada pesan user untuk regenerate." });
+    }
+
+    const usage = await getUsage(req.user.id);
+    const limit = dailyLimitForUser(req.user);
+
+    if (usage.messageCount >= limit) {
+      return res.status(429).json({
+        error: `Limit harian tercapai. Limit kamu ${limit} chat/hari.`,
+        usage: {
+          messageCount: usage.messageCount,
+          tokenCount: usage.tokenCount,
+          limit
+        }
+      });
+    }
+
+    const history = allMessages
+      .filter((item) => item.createdAt < lastUserMessage.createdAt)
+      .slice(-10);
+
+    const aiResult = await callX5Lab({
+      modelId: model.id,
+      text: lastUserMessage.content,
+      file: null,
+      history,
+      contextText: lastUserMessage.contextText || "",
+      sendImageBlock: false
+    });
+
+    const assistantMessage = await prisma.message.create({
+      data: {
+        conversationId: conversation.id,
+        userId: req.user.id,
+        role: "ASSISTANT",
+        content: aiResult.answer,
+        model: selectedKey
+      }
+    });
+
+    const updatedUsage = await prisma.dailyUsage.update({
+      where: {
+        userId_date: {
+          userId: req.user.id,
+          date: todayStart()
+        }
+      },
+      data: {
+        messageCount: { increment: 1 },
+        tokenCount: { increment: aiResult.totalTokens || 0 }
+      }
+    });
+
+    await prisma.conversation.update({
+      where: { id: conversation.id },
+      data: { model: selectedKey, updatedAt: new Date() }
+    });
+
+    res.json({
+      assistantMessage,
+      usage: {
+        messageCount: updatedUsage.messageCount,
+        tokenCount: updatedUsage.tokenCount,
+        limit
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: "Regenerate gagal.", detail: error.message });
+  }
+});
+
+app.get("/api/admin/stats", auth, adminOnly, async (req, res) => {
+  try {
+    const [users, conversations, messages, usageRows] = await Promise.all([
+      prisma.user.count(),
+      prisma.conversation.count(),
+      prisma.message.count(),
+      prisma.dailyUsage.findMany({
+        where: {
+          date: todayStart()
+        }
+      })
+    ]);
+
+    const todayChats = usageRows.reduce((sum, item) => sum + item.messageCount, 0);
+    const todayTokens = usageRows.reduce((sum, item) => sum + item.tokenCount, 0);
+
+    res.json({
+      users,
+      conversations,
+      messages,
+      todayChats,
+      todayTokens
+    });
+  } catch (error) {
+    res.status(500).json({ error: "Gagal load admin stats.", detail: error.message });
+  }
+});
+
+app.get("/api/admin/users", auth, adminOnly, async (req, res) => {
+  try {
+    const users = await prisma.user.findMany({
+      orderBy: {
+        createdAt: "desc"
+      },
+      take: 100,
+      include: {
+        dailyUsages: {
+          where: { date: todayStart() },
+          take: 1
+        },
+        _count: {
+          select: {
+            conversations: true,
+            messages: true
+          }
+        }
+      }
+    });
+
+    res.json({
+      users: users.map((item) => ({
+        id: item.id,
+        name: item.name,
+        email: item.email,
+        role: item.role,
+        plan: item.plan,
+        avatarUrl: item.avatarUrl,
+        emailVerifiedAt: item.emailVerifiedAt,
+        createdAt: item.createdAt,
+        todayUsage: item.dailyUsages[0] || { messageCount: 0, tokenCount: 0 },
+        counts: item._count
+      }))
+    });
+  } catch (error) {
+    res.status(500).json({ error: "Gagal load users.", detail: error.message });
+  }
+});
+
+app.patch("/api/admin/users/:id", auth, adminOnly, async (req, res) => {
+  try {
+    const role = String(req.body.role || "").toUpperCase();
+    const plan = String(req.body.plan || "").toUpperCase();
+
+    if (!["USER", "ADMIN"].includes(role) || !["FREE", "ADMIN"].includes(plan)) {
+      return res.status(400).json({ error: "Role/plan tidak valid." });
+    }
+
+    const updated = await prisma.user.update({
+      where: { id: req.params.id },
+      data: { role, plan }
+    });
+
+    res.json({ user: publicUser(updated) });
+  } catch (error) {
+    res.status(500).json({ error: "Gagal update user.", detail: error.message });
+  }
+});
+
+
+app.get("/api/conversations/:id/messages", auth, async (req, res) => {
+  const conversation = await prisma.conversation.findFirst({
+    where: {
+      id: req.params.id,
+      userId: req.user.id
+    }
+  });
+
+  if (!conversation) {
+    return res.status(404).json({ error: "Conversation tidak ditemukan." });
+  }
+
+  const messages = await prisma.message.findMany({
+    where: {
+      conversationId: conversation.id
+    },
+    orderBy: {
+      createdAt: "asc"
+    }
+  });
+
+  res.json({
+    conversation,
+    messages
+  });
+});
+
+app.delete("/api/conversations/:id", auth, async (req, res) => {
+  const conversation = await prisma.conversation.findFirst({
+    where: {
+      id: req.params.id,
+      userId: req.user.id
+    }
+  });
+
+  if (!conversation) {
+    return res.status(404).json({ error: "Conversation tidak ditemukan." });
+  }
+
+  await prisma.conversation.delete({
+    where: {
+      id: conversation.id
+    }
+  });
+
+  res.json({
+    ok: true
+  });
+});
+
+app.post("/api/chat", auth, uploadSingle, async (req, res) => {
+  try {
+    if (!req.user.emailVerifiedAt && req.user.role !== "ADMIN") {
+      return res.status(403).json({
+        error: "Verifikasi email dulu sebelum memakai chatbot. Klik tombol resend verification di sidebar."
+      });
+    }
+
+    const text = String(req.body.message || "").trim();
+    const selectedKey = String(req.body.model || "balanced").trim();
+    const conversationId = String(req.body.conversationId || "").trim();
+    const repoUrl = String(req.body.repoUrl || "").trim();
+    const file = req.file || null;
+
+    if (!text && !file && !repoUrl) {
+      return res.status(400).json({
+        error: "Pesan, file, atau GitHub repo tidak boleh kosong."
+      });
+    }
+
+    if (text.length > 5000) {
+      return res.status(400).json({
+        error: "Pesan terlalu panjang. Maksimal 5000 karakter."
+      });
+    }
+
+    const model = MODEL_CONFIG[selectedKey];
+
+    if (!model) {
+      return res.status(400).json({
+        error: "Model tidak valid."
+      });
+    }
+
+    if (req.user.role !== "ADMIN" && !model.allowedForFree) {
+      return res.status(403).json({
+        error: "Model ini khusus admin dulu."
+      });
+    }
+
+    const usage = await getUsage(req.user.id);
+    const limit = dailyLimitForUser(req.user);
+
+    if (usage.messageCount >= limit) {
+      return res.status(429).json({
+        error: `Limit harian tercapai. Limit kamu ${limit} chat/hari.`,
+        usage: {
+          messageCount: usage.messageCount,
+          tokenCount: usage.tokenCount,
+          limit
+        }
+      });
+    }
+
+    let conversation;
+
+    if (conversationId) {
+      conversation = await prisma.conversation.findFirst({
+        where: {
+          id: conversationId,
+          userId: req.user.id
+        }
+      });
+
+      if (!conversation) {
+        return res.status(404).json({
+          error: "Conversation tidak ditemukan."
+        });
+      }
+    } else {
+      conversation = await prisma.conversation.create({
+        data: {
+          title: makeConversationTitle(text, Boolean(file), repoUrl),
+          userId: req.user.id,
+          model: selectedKey
+        }
+      });
+    }
+
+    const history = await prisma.message.findMany({
+      where: {
+        conversationId: conversation.id
+      },
+      orderBy: {
+        createdAt: "desc"
+      },
+      take: 10
+    });
+
+    const orderedHistory = history.reverse();
+
+    const savedFile = file ? saveUploadForUser(req.user.id, file) : null;
+
+    let extractedFileText = "";
+    if (file) {
+      extractedFileText = await extractTextFromFile(file);
+    }
+
+    let repoContext = "";
+    if (repoUrl) {
+      try {
+        repoContext = await fetchGitHubRepoContext(repoUrl);
+      } catch (error) {
+        repoContext = `Gagal mengambil GitHub repo dari URL ${repoUrl}: ${error.message}`;
+      }
+    }
+
+    const contextText = buildContextText({
+      extractedFileText,
+      repoContext
+    });
+
+    const userMessage = await prisma.message.create({
+      data: {
+        conversationId: conversation.id,
+        userId: req.user.id,
+        role: "USER",
+        content: text || (repoUrl ? "Tolong analisis GitHub repo ini." : "Tolong analisis lampiran ini."),
+        model: selectedKey,
+        attachmentUrl: savedFile?.url || null,
+        attachmentName: savedFile?.name || null,
+        attachmentMime: savedFile?.mime || null,
+        repoUrl: repoUrl || null,
+        contextText: contextText || null
+      }
+    });
+
+    let aiResult;
+
+    try {
+      aiResult = await callX5Lab({
+        modelId: model.id,
+        text: text || (repoUrl ? "Tolong analisis GitHub repo ini." : "Tolong analisis lampiran ini."),
+        file,
+        history: orderedHistory,
+        contextText,
+        sendImageBlock: false
+      });
+    } catch (error) {
+      const status = error.status || 500;
+      const detail = error.message || "Gagal menghubungi AI provider.";
+
+      const assistantMessage = await prisma.message.create({
+        data: {
+          conversationId: conversation.id,
+          userId: req.user.id,
+          role: "ASSISTANT",
+          content:
+            status === 402
+              ? "Token AI sedang habis."
+              : `AI provider error: ${detail}`,
+          model: selectedKey
+        }
+      });
+
+      return res.status(status >= 400 && status < 600 ? status : 500).json({
+        error: assistantMessage.content,
+        conversation,
+        userMessage,
+        assistantMessage,
+        usage: {
+          messageCount: usage.messageCount,
+          tokenCount: usage.tokenCount,
+          limit
+        }
+      });
+    }
+
+    const assistantMessage = await prisma.message.create({
+      data: {
+        conversationId: conversation.id,
+        userId: req.user.id,
+        role: "ASSISTANT",
+        content: aiResult.answer,
+        model: selectedKey
+      }
+    });
+
+    const contextTokenEstimate = Math.ceil((contextText || "").length / 4);
+    const updatedUsage = await prisma.dailyUsage.update({
+      where: {
+        userId_date: {
+          userId: req.user.id,
+          date: todayStart()
+        }
+      },
+      data: {
+        messageCount: {
+          increment: 1
+        },
+        tokenCount: {
+          increment: aiResult.totalTokens || contextTokenEstimate
+        }
+      }
+    });
+
+    const updatedConversation = await prisma.conversation.update({
+      where: {
+        id: conversation.id
+      },
+      data: {
+        model: selectedKey,
+        updatedAt: new Date()
+      }
+    });
+
+    res.json({
+      conversation: updatedConversation,
+      userMessage: {
+        ...userMessage,
+        contextText: undefined
+      },
+      assistantMessage,
+      answer: assistantMessage.content,
+      providerUsage: aiResult.usage,
+      usage: {
+        messageCount: updatedUsage.messageCount,
+        tokenCount: updatedUsage.tokenCount,
+        limit
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: "Server error.",
+      detail: error.message
+    });
+  }
+});
+
+app.use((err, req, res, next) => {
+  res.status(500).json({
+    error: "Server error.",
+    detail: err.message
+  });
+});
+
+app.listen(PORT, () => {
+  console.log(`UrbanMotion AI API running on http://localhost:${PORT}`);
+});
