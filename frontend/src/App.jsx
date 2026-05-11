@@ -80,6 +80,100 @@ function apiUrl(path) {
   return `${API_URL}${path}`;
 }
 
+
+function guessLangFromPath(filePath = "") {
+  const ext = filePath.split(".").pop()?.toLowerCase();
+
+  const map = {
+    js: "js",
+    jsx: "jsx",
+    ts: "ts",
+    tsx: "tsx",
+    css: "css",
+    html: "html",
+    json: "json",
+    py: "python",
+    java: "java",
+    php: "php",
+    rb: "ruby",
+    go: "go",
+    rs: "rust",
+    sql: "sql",
+    prisma: "prisma",
+    yml: "yaml",
+    yaml: "yaml",
+    md: "markdown",
+    sh: "bash"
+  };
+
+  return map[ext] || "";
+}
+
+function normalizeAiMarkdown(content = "") {
+  let text = String(content || "");
+
+  // Convert common pseudo XML code output into readable Markdown.
+  text = text.replace(
+    /<write_file>\s*<path>([\s\S]*?)<\/path>\s*<content>([\s\S]*?)<\/content>\s*<\/write_file>/g,
+    (_, rawPath, rawCode) => {
+      const filePath = rawPath.trim();
+      const code = rawCode
+        .replace(/^```[a-zA-Z0-9_-]*\n?/, "")
+        .replace(/```$/, "")
+        .trim();
+      const lang = guessLangFromPath(filePath);
+      return `\n\n### \`${filePath}\`\n\n\`\`\`${lang}\n${code}\n\`\`\`\n\n`;
+    }
+  );
+
+  text = text.replace(
+    /<file>\s*<path>([\s\S]*?)<\/path>\s*<content>([\s\S]*?)<\/content>\s*<\/file>/g,
+    (_, rawPath, rawCode) => {
+      const filePath = rawPath.trim();
+      const code = rawCode.trim();
+      const lang = guessLangFromPath(filePath);
+      return `\n\n### \`${filePath}\`\n\n\`\`\`${lang}\n${code}\n\`\`\`\n\n`;
+    }
+  );
+
+  return text;
+}
+
+function CodeBlock({ inline, className, children, ...props }) {
+  const codeText = String(children || "").replace(/\n$/, "");
+  const match = /language-(\w+)/.exec(className || "");
+
+  if (inline) {
+    return (
+      <code className={className} {...props}>
+        {children}
+      </code>
+    );
+  }
+
+  async function copyCode() {
+    try {
+      await navigator.clipboard.writeText(codeText);
+    } catch {
+      // ignore clipboard failure
+    }
+  }
+
+  return (
+    <div className="code-shell">
+      <div className="code-header">
+        <span>{match?.[1] || "code"}</span>
+        <button type="button" onClick={copyCode}>Copy code</button>
+      </div>
+      <pre className={className}>
+        <code className={className} {...props}>
+          {children}
+        </code>
+      </pre>
+    </div>
+  );
+}
+
 function formatDate(value) {
   if (!value) return "";
   const date = new Date(value);
@@ -1245,8 +1339,11 @@ export default function App() {
                       <ReactMarkdown
                         remarkPlugins={[remarkGfm]}
                         rehypePlugins={[rehypeHighlight]}
+                        components={{
+                          code: CodeBlock
+                        }}
                       >
-                        {message.content}
+                        {normalizeAiMarkdown(message.content)}
                       </ReactMarkdown>
                     </div>
 
