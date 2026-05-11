@@ -28,6 +28,10 @@ const UPLOAD_DIR = path.join(__dirname, "uploads");
 const MAX_CONTEXT_CHARS = Number(process.env.MAX_CONTEXT_CHARS || 120000);
 const GITHUB_MAX_FILES = Number(process.env.GITHUB_MAX_FILES || 35);
 const GITHUB_MAX_FILE_CHARS = Number(process.env.GITHUB_MAX_FILE_CHARS || 20000);
+const MAX_OUTPUT_TOKENS = Number(process.env.MAX_OUTPUT_TOKENS || 1600);
+const MAX_INPUT_TOKENS_PER_REQUEST = Number(process.env.MAX_INPUT_TOKENS_PER_REQUEST || 32000);
+const DAILY_REPO_SCAN_LIMIT = Number(process.env.DAILY_REPO_SCAN_LIMIT || 3);
+const DAILY_UPLOAD_LIMIT = Number(process.env.DAILY_UPLOAD_LIMIT || 5);
 
 if (!fs.existsSync(UPLOAD_DIR)) {
   fs.mkdirSync(UPLOAD_DIR, { recursive: true });
@@ -167,6 +171,8 @@ function publicUser(user) {
     avatarUrl: user.avatarUrl,
     role: user.role,
     plan: user.plan,
+    status: user.status,
+    customDailyLimit: user.customDailyLimit,
     createdAt: user.createdAt
   };
 }
@@ -188,7 +194,15 @@ function todayStart() {
   return now;
 }
 
+function estimateTokens(text) {
+  return Math.ceil(String(text || "").length / 4);
+}
+
 function dailyLimitForUser(user) {
+  if (Number.isInteger(user.customDailyLimit) && user.customDailyLimit > 0) {
+    return user.customDailyLimit;
+  }
+
   if (user.role === "ADMIN") return Number(process.env.ADMIN_DAILY_LIMIT || 9999);
   return Number(process.env.FREE_DAILY_LIMIT || 20);
 }
@@ -239,6 +253,10 @@ async function auth(req, res, next) {
 
     if (!user) {
       return res.status(401).json({ error: "User tidak ditemukan." });
+    }
+
+    if (user.status === "SUSPENDED") {
+      return res.status(403).json({ error: "Akun kamu sedang disuspend. Hubungi admin." });
     }
 
     req.user = user;
@@ -898,7 +916,7 @@ async function callX5Lab({ modelId, text, file, history, contextText, sendImageB
       model: modelId,
       messages,
       temperature: 0.7,
-      max_tokens: 1600
+      max_tokens: MAX_OUTPUT_TOKENS
     })
   });
 
@@ -931,8 +949,33 @@ async function callX5Lab({ modelId, text, file, history, contextText, sendImageB
 app.get("/", (req, res) => {
   res.json({
     status: "UrbanMotion AI API running",
-    endpoints: ["/api/auth/register", "/api/auth/login", "/api/auth/google", "/api/auth/github", "/api/me", "/api/chat"]
+    endpoints: ["/api/auth/register", "/api/auth/login", "/api/auth/google", "/api/auth/github", "/api/me", "/api/chat", "/api/health"]
   });
+});
+
+app.get(["/health", "/api/health"], async (req, res) => {
+  const startedAt = Date.now();
+
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+
+    res.json({
+      ok: true,
+      service: "UrbanMotion AI API",
+      uptime: process.uptime(),
+      database: "ok",
+      latencyMs: Date.now() - startedAt,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    res.status(503).json({
+      ok: false,
+      service: "UrbanMotion AI API",
+      database: "error",
+      error: error.message,
+      timestamp: new Date().toISOString()
+    });
+  }
 });
 
 app.get("/api/models", (req, res) => {
@@ -1020,6 +1063,10 @@ app.post("/api/auth/login", async (req, res) => {
 
     if (!user) {
       return res.status(401).json({ error: "Email atau password salah." });
+    }
+
+    if (user.status === "SUSPENDED") {
+      return res.status(403).json({ error: "Akun ini sedang disuspend." });
     }
 
     if (!user.passwordHash) {
@@ -1732,8 +1779,15 @@ app.get("/api/admin/stats", auth, adminOnly, async (req, res) => {
     const todayChats = usageRows.reduce((sum, item) => sum + item.messageCount, 0);
     const todayTokens = usageRows.reduce((sum, item) => sum + item.tokenCount, 0);
 
+    const [activeUsers, suspendedUsers] = await Promise.all([
+      prisma.user.count({ where: { status: "ACTIVE" } }),
+      prisma.user.count({ where: { status: "SUSPENDED" } })
+    ]);
+
     res.json({
       users,
+      activeUsers,
+      suspendedUsers,
       conversations,
       messages,
       todayChats,
@@ -1772,6 +1826,8 @@ app.get("/api/admin/users", auth, adminOnly, async (req, res) => {
         email: item.email,
         role: item.role,
         plan: item.plan,
+        status: item.status,
+        customDailyLimit: item.customDailyLimit,
         avatarUrl: item.avatarUrl,
         emailVerifiedAt: item.emailVerifiedAt,
         createdAt: item.createdAt,
@@ -1786,21 +1842,88 @@ app.get("/api/admin/users", auth, adminOnly, async (req, res) => {
 
 app.patch("/api/admin/users/:id", auth, adminOnly, async (req, res) => {
   try {
-    const role = String(req.body.role || "").toUpperCase();
-    const plan = String(req.body.plan || "").toUpperCase();
+    const data = {};
 
-    if (!["USER", "ADMIN"].includes(role) || !["FREE", "ADMIN"].includes(plan)) {
-      return res.status(400).json({ error: "Role/plan tidak valid." });
+    if (typeof req.body.role !== "undefined") {
+      const role = String(req.body.role || "").toUpperCase();
+      if (!["USER", "ADMIN"].includes(role)) {
+        return res.status(400).json({ error: "Role tidak valid." });
+      }
+      data.role = role;
+      data.plan = role === "ADMIN" ? "ADMIN" : "FREE";
+    }
+
+    if (typeof req.body.plan !== "undefined") {
+      const plan = String(req.body.plan || "").toUpperCase();
+      if (!["FREE", "ADMIN"].includes(plan)) {
+        return res.status(400).json({ error: "Plan tidak valid." });
+      }
+      data.plan = plan;
+    }
+
+    if (typeof req.body.status !== "undefined") {
+      const status = String(req.body.status || "").toUpperCase();
+      if (!["ACTIVE", "SUSPENDED"].includes(status)) {
+        return res.status(400).json({ error: "Status tidak valid." });
+      }
+
+      if (req.params.id === req.user.id && status === "SUSPENDED") {
+        return res.status(400).json({ error: "Admin tidak bisa suspend akun sendiri." });
+      }
+
+      data.status = status;
+    }
+
+    if (typeof req.body.customDailyLimit !== "undefined") {
+      const rawLimit = req.body.customDailyLimit;
+      const customDailyLimit = rawLimit === "" || rawLimit === null ? null : Number(rawLimit);
+
+      if (customDailyLimit !== null && (!Number.isInteger(customDailyLimit) || customDailyLimit < 1 || customDailyLimit > 100000)) {
+        return res.status(400).json({ error: "Custom limit harus angka 1 sampai 100000." });
+      }
+
+      data.customDailyLimit = customDailyLimit;
+    }
+
+    if (Object.keys(data).length === 0) {
+      return res.status(400).json({ error: "Tidak ada field yang diubah." });
     }
 
     const updated = await prisma.user.update({
       where: { id: req.params.id },
-      data: { role, plan }
+      data
     });
 
     res.json({ user: publicUser(updated) });
   } catch (error) {
     res.status(500).json({ error: "Gagal update user.", detail: error.message });
+  }
+});
+
+app.post("/api/admin/users/:id/reset-usage", auth, adminOnly, async (req, res) => {
+  try {
+    await prisma.dailyUsage.upsert({
+      where: {
+        userId_date: {
+          userId: req.params.id,
+          date: todayStart()
+        }
+      },
+      update: {
+        messageCount: 0,
+        tokenCount: 0
+      },
+      create: {
+        userId: req.params.id,
+        date: todayStart(),
+        messageCount: 0,
+        tokenCount: 0
+      }
+    });
+
+    res.json({ ok: true, message: "Usage hari ini berhasil direset." });
+  } catch (error) {
+    res.status(500).json({ error: "Gagal reset usage.", detail: error.message });
   }
 });
 
@@ -1868,6 +1991,38 @@ app.post("/api/chat", auth, uploadSingle, async (req, res) => {
     const conversationId = String(req.body.conversationId || "").trim();
     const repoUrl = String(req.body.repoUrl || "").trim();
     const file = req.file || null;
+
+    if (repoUrl) {
+      const repoScanCount = await prisma.message.count({
+        where: {
+          userId: req.user.id,
+          repoUrl: { not: null },
+          createdAt: { gte: todayStart() }
+        }
+      });
+
+      if (repoScanCount >= DAILY_REPO_SCAN_LIMIT) {
+        return res.status(429).json({
+          error: `Limit scan GitHub repo harian tercapai. Limit kamu ${DAILY_REPO_SCAN_LIMIT} repo/hari.`
+        });
+      }
+    }
+
+    if (file) {
+      const uploadCount = await prisma.message.count({
+        where: {
+          userId: req.user.id,
+          attachmentUrl: { not: null },
+          createdAt: { gte: todayStart() }
+        }
+      });
+
+      if (uploadCount >= DAILY_UPLOAD_LIMIT) {
+        return res.status(429).json({
+          error: `Limit upload file harian tercapai. Limit kamu ${DAILY_UPLOAD_LIMIT} file/hari.`
+        });
+      }
+    }
 
     if (!text && !file && !repoUrl) {
       return res.status(400).json({
@@ -1966,6 +2121,14 @@ app.post("/api/chat", auth, uploadSingle, async (req, res) => {
       extractedFileText,
       repoContext
     });
+
+    const estimatedInputTokens = estimateTokens(`${text}\n${contextText}`);
+
+    if (estimatedInputTokens > MAX_INPUT_TOKENS_PER_REQUEST) {
+      return res.status(413).json({
+        error: `Context terlalu besar (${estimatedInputTokens} estimasi token). Maksimal ${MAX_INPUT_TOKENS_PER_REQUEST} token/request. Kurangi file/repo/prompt.`
+      });
+    }
 
     const userMessage = await prisma.message.create({
       data: {
@@ -2091,6 +2254,23 @@ app.use((err, req, res, next) => {
   });
 });
 
-app.listen(PORT, () => {
+const serverInstance = app.listen(PORT, () => {
   console.log(`UrbanMotion AI API running on http://localhost:${PORT}`);
 });
+
+async function shutdown(signal) {
+  console.log(`${signal} received. Shutting down gracefully...`);
+
+  serverInstance.close(async () => {
+    await prisma.$disconnect();
+    process.exit(0);
+  });
+
+  setTimeout(() => {
+    console.error("Forced shutdown.");
+    process.exit(1);
+  }, 10000).unref();
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));

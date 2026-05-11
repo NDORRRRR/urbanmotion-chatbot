@@ -17,6 +17,11 @@ enum Plan {
   ADMIN
 }
 
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+}
+
 enum MessageRole {
   USER
   ASSISTANT
@@ -32,6 +37,8 @@ model User {
   avatarUrl          String?
   role               Role                @default(USER)
   plan               Plan                @default(FREE)
+  status             UserStatus          @default(ACTIVE)
+  customDailyLimit   Int?
 
   oauthAccounts      OAuthAccount[]
   verificationTokens VerificationToken[]

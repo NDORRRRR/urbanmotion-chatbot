@@ -788,7 +788,7 @@ export default function App() {
     }
   }
 
-  async function updateAdminUser(userId, role, plan) {
+  async function updateAdminUser(userId, patch) {
     try {
       const res = await fetch(`${API_URL}/api/admin/users/${userId}`, {
         method: "PATCH",
@@ -796,13 +796,35 @@ export default function App() {
           Authorization: `Bearer ${token}`,
           "Content-Type": "application/json"
         },
-        body: JSON.stringify({ role, plan })
+        body: JSON.stringify(patch)
       });
 
       const data = await res.json();
 
       if (!res.ok) {
         alert(data.error || "Gagal update user.");
+        return;
+      }
+
+      await loadAdminDashboard();
+    } catch {
+      alert("Backend belum bisa dihubungi.");
+    }
+  }
+
+  async function resetUserUsage(userId) {
+    try {
+      const res = await fetch(`${API_URL}/api/admin/users/${userId}/reset-usage`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`
+        }
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        alert(data.error || "Gagal reset usage.");
         return;
       }
 
@@ -1695,6 +1717,78 @@ export default function App() {
                     <p className="muted-copy">
                       Limit dihitung per hari per akun. Admin punya limit lebih besar dan akses semua model.
                     </p>
+                  </div>
+                )}
+
+                {settingsTab === "admin" && isAdmin && (
+                  <div className="settings-section">
+                    <h3>Admin dashboard</h3>
+                    <p className="muted-copy">Pantau user, token, suspend akun, ubah role, dan atur limit harian.</p>
+
+                    <div className="big-usage">
+                      <div>
+                        <strong>{adminStats?.users || 0}</strong>
+                        <span>total users</span>
+                      </div>
+                      <div>
+                        <strong>{adminStats?.suspendedUsers || 0}</strong>
+                        <span>suspended</span>
+                      </div>
+                      <div>
+                        <strong>{adminStats?.todayTokens || 0}</strong>
+                        <span>today tokens</span>
+                      </div>
+                    </div>
+
+                    <div className="admin-user-list">
+                      {adminUsers.map((item) => (
+                        <div className="admin-user-item" key={item.id}>
+                          <div className="admin-user-main">
+                            <div className="mini-avatar">
+                              {item.avatarUrl ? <img src={apiUrl(item.avatarUrl)} alt={item.name} /> : <UserRound size={17} />}
+                            </div>
+                            <div>
+                              <strong>{item.name}</strong>
+                              <span>{item.email}</span>
+                              <em>
+                                {item.counts?.conversations || 0} chats • {item.todayUsage?.messageCount || 0} today • {item.todayUsage?.tokenCount || 0} tokens
+                              </em>
+                            </div>
+                          </div>
+
+                          <div className="admin-controls extended">
+                            <select
+                              value={item.role}
+                              onChange={(event) => updateAdminUser(item.id, { role: event.target.value })}
+                            >
+                              <option value="USER">USER</option>
+                              <option value="ADMIN">ADMIN</option>
+                            </select>
+
+                            <select
+                              value={item.status || "ACTIVE"}
+                              onChange={(event) => updateAdminUser(item.id, { status: event.target.value })}
+                            >
+                              <option value="ACTIVE">ACTIVE</option>
+                              <option value="SUSPENDED">SUSPENDED</option>
+                            </select>
+
+                            <input
+                              type="number"
+                              min="1"
+                              max="100000"
+                              placeholder="limit"
+                              defaultValue={item.customDailyLimit || ""}
+                              onBlur={(event) => updateAdminUser(item.id, { customDailyLimit: event.target.value })}
+                            />
+
+                            <button type="button" onClick={() => resetUserUsage(item.id)}>
+                              Reset usage
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
                   </div>
                 )}
               </div>
